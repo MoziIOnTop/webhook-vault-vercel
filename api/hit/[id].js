@@ -67,7 +67,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  const { id } = req.query;
+  const { id, wait } = req.query;
   if (!id) {
     res.status(400).json({ error: "Missing id" });
     return;
@@ -127,20 +127,34 @@ module.exports = async (req, res) => {
       return;
     }
 
-    const webhookUrl = decrypt(rows[0].webhook_enc);
+ const webhookUrl = decrypt(rows[0].webhook_enc);
 
-    // Forward tới Discord
-    const discordResp = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: rawBody,
-    });
+// nếu client gọi .../api/hit/wh_xxx?wait=true thì forward ?wait=true lên Discord
+const useWait =
+  typeof wait === "string" && wait.toLowerCase() === "true";
 
-    const text = await discordResp.text();
+const targetUrl = useWait ? `${webhookUrl}?wait=true` : webhookUrl;
 
-    res
-      .status(discordResp.status)
-      .json({ status: discordResp.status, response: text });
+// Forward tới Discord
+const discordResp = await fetch(targetUrl, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: rawBody,
+});
+
+const text = await discordResp.text();
+
+// Cố parse JSON Discord trả về (có id, channel_id,...)
+// nếu parse fail thì trả raw cho đỡ toang
+let json;
+try {
+  json = JSON.parse(text);
+} catch {
+  json = { raw: text };
+}
+
+res.status(discordResp.status).json(json);
+
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Internal error" });
