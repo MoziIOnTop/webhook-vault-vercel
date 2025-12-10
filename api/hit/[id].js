@@ -172,6 +172,20 @@ module.exports = async (req, res) => {
       .trim() ||
     req.socket?.remoteAddress ||
     "unknown";
+  // ===== Only allow payloads that have at least 1 embed =====
+  const hasEmbed =
+    body &&
+    Array.isArray(body.embeds) &&
+    body.embeds.length > 0;
+
+  if (!hasEmbed) {
+    // Không cho gửi message không có embed để tránh spam text thuần
+    return res.status(403).json({
+      error: "Embeds required",
+      reason: "This protected webhook only accepts payloads that include at least one embed."
+    });
+  }
+  // ==========================================================
 
   // Rate limit tổng
   if (!checkIp(ip)) {
