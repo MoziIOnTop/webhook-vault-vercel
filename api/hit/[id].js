@@ -9,7 +9,7 @@ const {
 
 function getKey() {
   const base = ENCRYPTION_KEY || "CHANGE_THIS_TO_A_LONG_SECRET";
-  return crypto.createHash("sha256").update(String(base)).digest(); // 32 bytes
+  return crypto.createHash("sha256").update(String(base)).digest();
 }
 
 function decrypt(b64) {
@@ -24,7 +24,7 @@ function decrypt(b64) {
   return dec.toString("utf8");
 }
 
-// ========= Rate limit cũ (tổng request) =========
+// ========= Rate limit đơn giản (in-memory) =========
 const ipHits = new Map(); // ip -> [timestamps]
 const idHits = new Map(); // id -> [timestamps]
 
@@ -59,89 +59,6 @@ function checkId(id) {
   return true;
 }
 
-// ========= Anti-SPAM theo IP (@everyone + trùng content) =========
-
-// Đếm @everyone theo IP
-// ip -> [timestamps] (chỉ cho các message có @everyone)
-const ipEveryoneHits = new Map();
-
-// Đếm content trùng theo IP
-// ip -> Map<normalizedText, [timestamps]>
-const ipContentHits = new Map();
-
-// gom toàn bộ text từ content + embeds để check
-function extractAllText(body) {
-  const parts = [];
-  if (body && typeof body.content === "string") {
-    parts.push(body.content);
-  }
-  const embeds = Array.isArray(body?.embeds) ? body.embeds : [];
-  for (const e of embeds) {
-    if (!e || typeof e !== "object") continue;
-    if (typeof e.title === "string") parts.push(e.title);
-    if (typeof e.description === "string") parts.push(e.description);
-    const fields = Array.isArray(e.fields) ? e.fields : [];
-    for (const f of fields) {
-      if (!f || typeof f !== "object") continue;
-      if (typeof f.name === "string") parts.push(f.name);
-      if (typeof f.value === "string") parts.push(f.value);
-    }
-  }
-  return parts.join("\n");
-}
-
-// Kiểm tra rule:
-// - 3 lần / phút hoặc 20 lần / ngày cho:
-//   + message có @everyone
-//   + message có cùng content (tính trên full text content + embeds)
-function checkAntiSpam(ip, body) {
-  const now = Date.now() / 1000;
-  const text = extractAllText(body);
-  const normalized = text.trim().toLowerCase();
-
-  // 1) Rule @everyone
-  if (/@everyone/i.test(text)) {
-    let arr = clean(ipEveryoneHits.get(ip) || [], now, 86400);
-    arr.push(now);
-    ipEveryoneHits.set(ip, arr);
-
-    const last1m = arr.filter((t) => now - t < 60).length;
-    const last1d = arr.length;
-
-    if (last1m > 3 || last1d > 20) {
-      return {
-        ok: false,
-        reason: "too many @everyone from this IP",
-      };
-    }
-  }
-
-  // 2) Rule content trùng (kể cả text trong embed)
-  if (normalized.length > 0) {
-    let map = ipContentHits.get(ip);
-    if (!map) {
-      map = new Map();
-      ipContentHits.set(ip, map);
-    }
-    let arr = clean(map.get(normalized) || [], now, 86400);
-    arr.push(now);
-    map.set(normalized, arr);
-
-    const last1m = arr.filter((t) => now - t < 60).length;
-    const last1d = arr.length;
-
-    if (last1m > 3 || last1d > 20) {
-      return {
-        ok: false,
-        reason: "too many identical messages from this IP",
-      };
-    }
-  }
-
-  // pass
-  return { ok: true };
-}
-
 // ============================================
 
 module.exports = async (req, res) => {
@@ -150,7 +67,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  const { id, wait } = req.query;
+  const { id, ...queryRest } = req.query || {};
   if (!id) {
     res.status(400).json({ error: "Missing id" });
     return;
@@ -172,38 +89,13 @@ module.exports = async (req, res) => {
       .trim() ||
     req.socket?.remoteAddress ||
     "unknown";
-  // ===== Only allow payloads that have at least 1 embed =====
-  const hasEmbed =
-    body &&
-    Array.isArray(body.embeds) &&
-    body.embeds.length > 0;
 
-  if (!hasEmbed) {
-    // Không cho gửi message không có embed để tránh spam text thuần
-    return res.status(403).json({
-      error: "Embeds required",
-      reason: "This protected webhook only accepts payloads that include at least one embed."
-    });
-  }
-  // ==========================================================
-
-  // Rate limit tổng
   if (!checkIp(ip)) {
     res.status(429).json({ error: "IP rate limit exceeded" });
     return;
   }
   if (!checkId(id)) {
     res.status(429).json({ error: "Webhook rate limit exceeded" });
-    return;
-  }
-
-  // Anti-SPAM riêng (everyone + trùng content)
-  const spamCheck = checkAntiSpam(ip, body);
-  if (!spamCheck.ok) {
-    res.status(429).json({
-      error: "Anti-spam limit",
-      reason: spamCheck.reason,
-    });
     return;
   }
 
@@ -237,16 +129,12 @@ module.exports = async (req, res) => {
 
     const webhookUrl = decrypt(rows[0].webhook_enc);
 
-    // Mặc định dùng ?wait=true để lấy message id
-    let useWait = true;
-    if (typeof wait !== "undefined") {
-      useWait = String(wait).toLowerCase() === "true";
-    }
-
+    // ---- GHÉP query (?wait=true, ...) sang Discord webhook ----
     let targetUrl = webhookUrl;
-    if (useWait) {
-      const sep = webhookUrl.includes("?") ? "&" : "?";
-      targetUrl = `${webhookUrl}${sep}wait=true`;
+    const qs = new URLSearchParams(queryRest || {});
+    const qsStr = qs.toString();
+    if (qsStr) {
+      targetUrl += (webhookUrl.includes("?") ? "&" : "?") + qsStr;
     }
 
     // Forward tới Discord
@@ -256,16 +144,11 @@ module.exports = async (req, res) => {
       body: rawBody,
     });
 
-    const text = await discordResp.text();
+    const text = await discordResp.text(); // nếu có JSON (wait=true) thì ở đây là JSON string
 
-    let json;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      json = { raw: text };
-    }
-
-    res.status(discordResp.status).json(json);
+    res
+      .status(discordResp.status)
+      .json({ status: discordResp.status, response: text });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Internal error" });
