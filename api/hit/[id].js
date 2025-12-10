@@ -24,7 +24,7 @@ function decrypt(b64) {
   return dec.toString("utf8");
 }
 
-// ========= Rate limit đơn giản (in-memory) =========
+// ========= Rate limit cũ (tổng request) =========
 const ipHits = new Map(); // ip -> [timestamps]
 const idHits = new Map(); // id -> [timestamps]
 
@@ -59,6 +59,89 @@ function checkId(id) {
   return true;
 }
 
+// ========= Anti-SPAM theo IP (@everyone + trùng content) =========
+
+// Đếm @everyone theo IP
+// ip -> [timestamps] (chỉ cho các message có @everyone)
+const ipEveryoneHits = new Map();
+
+// Đếm content trùng theo IP
+// ip -> Map<normalizedText, [timestamps]>
+const ipContentHits = new Map();
+
+// gom toàn bộ text từ content + embeds để check
+function extractAllText(body) {
+  const parts = [];
+  if (body && typeof body.content === "string") {
+    parts.push(body.content);
+  }
+  const embeds = Array.isArray(body?.embeds) ? body.embeds : [];
+  for (const e of embeds) {
+    if (!e || typeof e !== "object") continue;
+    if (typeof e.title === "string") parts.push(e.title);
+    if (typeof e.description === "string") parts.push(e.description);
+    const fields = Array.isArray(e.fields) ? e.fields : [];
+    for (const f of fields) {
+      if (!f || typeof f !== "object") continue;
+      if (typeof f.name === "string") parts.push(f.name);
+      if (typeof f.value === "string") parts.push(f.value);
+    }
+  }
+  return parts.join("\n");
+}
+
+// Kiểm tra rule:
+// - 3 lần / phút hoặc 20 lần / ngày cho:
+//   + message có @everyone
+//   + message có cùng content (tính trên full text content + embeds)
+function checkAntiSpam(ip, body) {
+  const now = Date.now() / 1000;
+  const text = extractAllText(body);
+  const normalized = text.trim().toLowerCase();
+
+  // 1) Rule @everyone
+  if (/@everyone/i.test(text)) {
+    let arr = clean(ipEveryoneHits.get(ip) || [], now, 86400);
+    arr.push(now);
+    ipEveryoneHits.set(ip, arr);
+
+    const last1m = arr.filter((t) => now - t < 60).length;
+    const last1d = arr.length;
+
+    if (last1m > 3 || last1d > 20) {
+      return {
+        ok: false,
+        reason: "too many @everyone from this IP",
+      };
+    }
+  }
+
+  // 2) Rule content trùng (kể cả text trong embed)
+  if (normalized.length > 0) {
+    let map = ipContentHits.get(ip);
+    if (!map) {
+      map = new Map();
+      ipContentHits.set(ip, map);
+    }
+    let arr = clean(map.get(normalized) || [], now, 86400);
+    arr.push(now);
+    map.set(normalized, arr);
+
+    const last1m = arr.filter((t) => now - t < 60).length;
+    const last1d = arr.length;
+
+    if (last1m > 3 || last1d > 20) {
+      return {
+        ok: false,
+        reason: "too many identical messages from this IP",
+      };
+    }
+  }
+
+  // pass
+  return { ok: true };
+}
+
 // ============================================
 
 module.exports = async (req, res) => {
@@ -90,12 +173,23 @@ module.exports = async (req, res) => {
     req.socket?.remoteAddress ||
     "unknown";
 
+  // Rate limit tổng
   if (!checkIp(ip)) {
     res.status(429).json({ error: "IP rate limit exceeded" });
     return;
   }
   if (!checkId(id)) {
     res.status(429).json({ error: "Webhook rate limit exceeded" });
+    return;
+  }
+
+  // Anti-SPAM riêng (everyone + trùng content)
+  const spamCheck = checkAntiSpam(ip, body);
+  if (!spamCheck.ok) {
+    res.status(429).json({
+      error: "Anti-spam limit",
+      reason: spamCheck.reason,
+    });
     return;
   }
 
@@ -129,10 +223,9 @@ module.exports = async (req, res) => {
 
     const webhookUrl = decrypt(rows[0].webhook_enc);
 
-    // Mặc định luôn dùng ?wait=true để lấy message id
+    // Mặc định dùng ?wait=true để lấy message id
     let useWait = true;
     if (typeof wait !== "undefined") {
-      // cho phép gọi ?wait=false nếu bạn muốn tắt
       useWait = String(wait).toLowerCase() === "true";
     }
 
@@ -151,7 +244,6 @@ module.exports = async (req, res) => {
 
     const text = await discordResp.text();
 
-    // Cố parse JSON Discord trả về (có id, channel_id,...)
     let json;
     try {
       json = JSON.parse(text);
