@@ -9,7 +9,7 @@ const {
 
 function getKey() {
   const base = ENCRYPTION_KEY || "CHANGE_THIS_TO_A_LONG_SECRET";
-  return crypto.createHash("sha256").update(String(base)).digest();
+  return crypto.createHash("sha256").update(String(base)).digest(); // 32 bytes
 }
 
 function decrypt(b64) {
@@ -127,34 +127,39 @@ module.exports = async (req, res) => {
       return;
     }
 
- const webhookUrl = decrypt(rows[0].webhook_enc);
+    const webhookUrl = decrypt(rows[0].webhook_enc);
 
-// nếu client gọi .../api/hit/wh_xxx?wait=true thì forward ?wait=true lên Discord
-const useWait =
-  typeof wait === "string" && wait.toLowerCase() === "true";
+    // Mặc định luôn dùng ?wait=true để lấy message id
+    let useWait = true;
+    if (typeof wait !== "undefined") {
+      // cho phép gọi ?wait=false nếu bạn muốn tắt
+      useWait = String(wait).toLowerCase() === "true";
+    }
 
-const targetUrl = useWait ? `${webhookUrl}?wait=true` : webhookUrl;
+    let targetUrl = webhookUrl;
+    if (useWait) {
+      const sep = webhookUrl.includes("?") ? "&" : "?";
+      targetUrl = `${webhookUrl}${sep}wait=true`;
+    }
 
-// Forward tới Discord
-const discordResp = await fetch(targetUrl, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: rawBody,
-});
+    // Forward tới Discord
+    const discordResp = await fetch(targetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: rawBody,
+    });
 
-const text = await discordResp.text();
+    const text = await discordResp.text();
 
-// Cố parse JSON Discord trả về (có id, channel_id,...)
-// nếu parse fail thì trả raw cho đỡ toang
-let json;
-try {
-  json = JSON.parse(text);
-} catch {
-  json = { raw: text };
-}
+    // Cố parse JSON Discord trả về (có id, channel_id,...)
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = { raw: text };
+    }
 
-res.status(discordResp.status).json(json);
-
+    res.status(discordResp.status).json(json);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Internal error" });
