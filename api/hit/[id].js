@@ -1,223 +1,156 @@
-// index.js - Status API: nhận WEBHOOK_URL (vault) + messageId, timeout thì PATCH Disconnected
+// api/hit/[id].js
+const crypto = require("crypto");
 
-import "dotenv/config";
-import express from "express";
-import cors from "cors";
-import { createClient } from "@supabase/supabase-js";
-import crypto from "crypto";
-import fetch from "node-fetch";
+const {
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  ENCRYPTION_KEY,
+} = process.env;
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// === ENV ===
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "CHANGE_THIS_TO_A_LONG_SECRET";
-const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 15000);
-
-// Supabase client (dùng để đọc webhook_enc giống vault)
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
-});
-
-// === Giải mã webhook_enc giống bên vault ===
 function getKey() {
-  return crypto.createHash("sha256").update(String(ENCRYPTION_KEY)).digest(); // 32 bytes
+  const base = ENCRYPTION_KEY || "CHANGE_THIS_TO_A_LONG_SECRET";
+  return crypto.createHash("sha256").update(String(base)).digest();
 }
 
-function decryptWebhook(b64) {
+function decrypt(b64) {
+  const key = getKey();
   const buf = Buffer.from(b64, "base64");
   const iv = buf.subarray(0, 12);
   const tag = buf.subarray(12, 28);
   const data = buf.subarray(28);
-  const decipher = crypto.createDecipheriv("aes-256-gcm", getKey(), iv);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
   const dec = Buffer.concat([decipher.update(data), decipher.final()]);
   return dec.toString("utf8");
 }
 
-// === Resolve: từ WEBHOOK_URL (vault hoặc webhook thật) -> webhook Discord ===
-async function resolveWebhook(webhookUrlOrVault) {
-  if (!webhookUrlOrVault) return null;
+// ========= Rate limit đơn giản (in-memory) =========
+const ipHits = new Map(); // ip -> [timestamps]
+const idHits = new Map(); // id -> [timestamps]
+
+function clean(arr, now, windowSec) {
+  return arr.filter((t) => now - t < windowSec);
+}
+
+function checkIp(ip) {
+  const now = Date.now() / 1000;
+  const arr = clean(ipHits.get(ip) || [], now, 3600);
+  arr.push(now);
+  ipHits.set(ip, arr);
+
+  const last1s = arr.filter((t) => now - t < 1).length;
+  const last60s = arr.filter((t) => now - t < 60).length;
+  const last3600 = arr.length;
+
+  if (last1s > 5 || last60s > 40 || last3600 > 500) return false;
+  return true;
+}
+
+function checkId(id) {
+  const now = Date.now() / 1000;
+  const arr = clean(idHits.get(id) || [], now, 3600);
+  arr.push(now);
+  idHits.set(id, arr);
+
+  const last60s = arr.filter((t) => now - t < 60).length;
+  const last3600 = arr.length;
+
+  if (last60s > 120 || last3600 > 2000) return false;
+  return true;
+}
+
+// ============================================
+
+module.exports = async (req, res) => {
+  if (req.method !== "POST") {
+    res.status(405).json({ error: "Method not allowed" });
+    return;
+  }
+
+  const { id, ...queryRest } = req.query || {};
+  if (!id) {
+    res.status(400).json({ error: "Missing id" });
+    return;
+  }
+
+  let body = {};
+  try {
+    body =
+      typeof req.body === "object" && req.body !== null
+        ? req.body
+        : JSON.parse(req.body || "{}");
+  } catch {
+    body = {};
+  }
+
+  const ip =
+    (req.headers["x-forwarded-for"] || "")
+      .split(",")[0]
+      .trim() ||
+    req.socket?.remoteAddress ||
+    "unknown";
+
+  if (!checkIp(ip)) {
+    res.status(429).json({ error: "IP rate limit exceeded" });
+    return;
+  }
+  if (!checkId(id)) {
+    res.status(429).json({ error: "Webhook rate limit exceeded" });
+    return;
+  }
+
+  // body size guard
+  const rawBody = JSON.stringify(body || {});
+  if (Buffer.byteLength(rawBody, "utf8") > 4000) {
+    res.status(413).json({ error: "Payload too large" });
+    return;
+  }
 
   try {
-    const u = new URL(webhookUrlOrVault);
+    // Lấy webhook_enc từ Supabase
+    const url = `${SUPABASE_URL}/rest/v1/webhooks?id=eq.${encodeURIComponent(
+      id
+    )}&select=webhook_enc`;
 
-    // Nếu đã là webhook Discord thật thì dùng luôn
-    if (
-      (/discord(app)?\.com$/).test(u.hostname) &&
-      u.pathname.includes("/api/webhooks/")
-    ) {
-      return webhookUrlOrVault;
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    });
+
+    const rows = await resp.json().catch(() => []);
+
+    if (!resp.ok || !Array.isArray(rows) || rows.length === 0) {
+      res.status(404).json({ error: "Unknown webhook id" });
+      return;
     }
 
-    // Nếu là vault: .../api/hit/wh_xxx
-    if (u.pathname.includes("/api/hit/wh_")) {
-      const m = u.pathname.match(/wh_[0-9a-zA-Z]+/);
-      if (!m) return null;
-      const vaultId = m[0];
+    const webhookUrl = decrypt(rows[0].webhook_enc);
 
-      const { data, error } = await supabase
-        .from("webhooks")
-        .select("webhook_enc")
-        .eq("id", vaultId)
-        .maybeSingle();
-
-      if (error || !data || !data.webhook_enc) {
-        console.error("[Status] resolveWebhook supabase error", error || data);
-        return null;
-      }
-
-      try {
-        const real = decryptWebhook(data.webhook_enc); // https://discord.com/api/webhooks/...
-        return real;
-      } catch (e) {
-        console.error("[Status] decryptWebhook error", e);
-        return null;
-      }
+    // ---- GHÉP query (?wait=true, ...) sang Discord webhook ----
+    let targetUrl = webhookUrl;
+    const qs = new URLSearchParams(queryRest || {});
+    const qsStr = qs.toString();
+    if (qsStr) {
+      targetUrl += (webhookUrl.includes("?") ? "&" : "?") + qsStr;
     }
+
+    // Forward tới Discord
+    const discordResp = await fetch(targetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: rawBody,
+    });
+
+    const text = await discordResp.text(); // nếu có JSON (wait=true) thì ở đây là JSON string
+
+    res
+      .status(discordResp.status)
+      .json({ status: discordResp.status, response: text });
   } catch (e) {
-    // webhookUrlOrVault không parse được như URL => có thể là direct webhook
-    console.error("[Status] resolveWebhook parse error", e);
+    console.error(e);
+    res.status(500).json({ error: "Internal error" });
   }
-
-  // Fallback: coi như đã là webhook thật
-  return webhookUrlOrVault;
-}
-
-// === PATCH message -> Disconnected ===
-async function patchMessageDisconnected(webhookKey, messageId, channelId, embed) {
-  const webhookUrl = await resolveWebhook(webhookKey);
-  if (!webhookUrl) {
-    throw new Error("Cannot resolve webhook");
-  }
-
-  const newEmbed = JSON.parse(JSON.stringify(embed || {}));
-
-  if (!Array.isArray(newEmbed.fields)) {
-    newEmbed.fields = [];
-  }
-
-  let found = false;
-  for (const f of newEmbed.fields) {
-    if (typeof f.name === "string" && f.name.toLowerCase().includes("status")) {
-      f.value = "🔴 **Disconnected**";
-      f.inline = true;
-      found = true;
-      break;
-    }
-  }
-  if (!found) {
-    newEmbed.fields.push({
-      name: "Status",
-      value: "🔴 **Disconnected**",
-      inline: true,
-    });
-  }
-
-  const payload = { embeds: [newEmbed] };
-
-  const url = `${webhookUrl}/messages/${messageId}`;
-
-  const res = await fetch(url, {
-    method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "Status-API",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    console.error("[Status] PATCH failed", res.status, text);
-    throw new Error("PATCH failed");
-  }
-}
-
-// ===== SESSIONS (RAM) =====
-const sessions = new Map();
-
-// POST /register
-app.post("/register", async (req, res) => {
-  try {
-    const {
-      sessionId,
-      webhookUrl,   // WEBHOOK_URL từ script (vault URL hoặc webhook thật)
-      messageId,
-      channelId,
-      username,
-      displayName,
-      placeId,
-      jobId,
-      embed,
-    } = req.body || {};
-
-    if (!sessionId || !webhookUrl || !messageId || !channelId) {
-      return res.status(400).json({ error: "missing fields" });
-    }
-
-    sessions.set(sessionId, {
-      sessionId,
-      webhookKey: webhookUrl,   // giữ vault URL, sau này resolve trong patch
-      messageId,
-      channelId,
-      username,
-      displayName,
-      placeId,
-      jobId,
-      embed,
-      lastPing: Date.now(),
-    });
-
-    console.log("[Status] Registered session", sessionId);
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("[Status] /register error", err);
-    return res.status(500).json({ error: "internal" });
-  }
-});
-
-// POST /ping
-app.post("/ping", (req, res) => {
-  try {
-    const { sessionId } = req.body || {};
-    if (!sessionId || !sessions.has(sessionId)) {
-      return res.status(404).json({ error: "session not found" });
-    }
-    const s = sessions.get(sessionId);
-    s.lastPing = Date.now();
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("[Status] /ping error", err);
-    return res.status(500).json({ error: "internal" });
-  }
-});
-
-// Timer: check timeout
-setInterval(async () => {
-  const now = Date.now();
-  for (const [sessionId, s] of sessions.entries()) {
-    if (now - s.lastPing > HEARTBEAT_TIMEOUT_MS) {
-      console.log("[Status] Session timeout:", sessionId);
-      try {
-        await patchMessageDisconnected(
-          s.webhookKey,
-          s.messageId,
-          s.channelId,
-          s.embed
-        );
-      } catch (err) {
-        console.error("[Status] patch disconnected failed:", err);
-      }
-      sessions.delete(sessionId);
-    }
-  }
-}, 5000);
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Status API listening on port", PORT);
-});
+};
