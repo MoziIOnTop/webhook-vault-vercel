@@ -140,13 +140,8 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // body size guard (nếu muốn bỏ limit thì xóa block này)
-  const rawBody = JSON.stringify(body || {});
-  if (Buffer.byteLength(rawBody, "utf8") > 4000) {
-    res.status(413).json({ error: "Payload too large" });
-    return;
-  }
-
+ const rawBody = JSON.stringify(body || {});
+  
   try {
     // Lấy webhook_enc từ Supabase
     const url = `${SUPABASE_URL}/rest/v1/webhooks?id=eq.${encodeURIComponent(
