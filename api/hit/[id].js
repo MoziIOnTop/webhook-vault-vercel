@@ -24,9 +24,12 @@ function decrypt(b64) {
   return dec.toString("utf8");
 }
 
-// ========= Rate limit đơn giản (in-memory) =========
+// ========= Rate limit cũ (tổng request) =========
 const ipHits = new Map(); // ip -> [timestamps]
 const idHits = new Map(); // id -> [timestamps]
+
+// ========= Rate limit mới chỉ cho EMBED =========
+const embedIpHits = new Map(); // ip -> [timestamps embed]
 
 function clean(arr, now, windowSec) {
   return arr.filter((t) => now - t < windowSec);
@@ -59,6 +62,24 @@ function checkId(id) {
   return true;
 }
 
+// ---- ONLY EMBED + limit 3/phút, 20/ngày ----
+function checkEmbedIp(ip) {
+  const now = Date.now() / 1000;
+
+  let arr = embedIpHits.get(ip) || [];
+  // giữ log 1 ngày
+  arr = clean(arr, now, 86400);
+  arr.push(now);
+  embedIpHits.set(ip, arr);
+
+  const last60s = arr.filter((t) => now - t < 60).length;
+  const lastDay = arr.length;
+
+  // >3 embed / phút hoặc >20 embed / ngày ⇒ chặn
+  if (last60s > 3 || lastDay > 20) return false;
+  return true;
+}
+
 // ============================================
 
 module.exports = async (req, res) => {
@@ -67,14 +88,13 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // id = wh_xxx trong path, queryRest giữ lại query (?wait=true,...)
   const { id, ...queryRest } = req.query || {};
   if (!id) {
     res.status(400).json({ error: "Missing id" });
     return;
   }
 
-  // parse body (Vercel đôi khi truyền string)
+  // Parse body an toàn
   let body = {};
   try {
     body =
@@ -92,6 +112,7 @@ module.exports = async (req, res) => {
     req.socket?.remoteAddress ||
     "unknown";
 
+  // rate limit tổng
   if (!checkIp(ip)) {
     res.status(429).json({ error: "IP rate limit exceeded" });
     return;
@@ -101,15 +122,30 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ===== body size guard – nới limit để embed dài vẫn qua được =====
-  const rawBody = JSON.stringify(body || {});
-  const MAX_BODY_BYTES = 12000; // có thể tăng nữa nếu embed cực dài
+  // ===== ONLY EMBED + rate limit embed theo IP =====
+  const embeds = Array.isArray(body.embeds) ? body.embeds : [];
 
-  if (Buffer.byteLength(rawBody, "utf8") > MAX_BODY_BYTES) {
+  if (!embeds || embeds.length === 0) {
+    // Không có embed ⇒ không cho dùng vault
+    res
+      .status(400)
+      .json({ error: "This vault only accepts payloads with embeds" });
+    return;
+  }
+
+  if (!checkEmbedIp(ip)) {
+    res
+      .status(429)
+      .json({ error: "Embed rate limit exceeded for this IP" });
+    return;
+  }
+
+  // body size guard (nếu muốn bỏ limit thì xóa block này)
+  const rawBody = JSON.stringify(body || {});
+  if (Buffer.byteLength(rawBody, "utf8") > 4000) {
     res.status(413).json({ error: "Payload too large" });
     return;
   }
-  // =================================================================
 
   try {
     // Lấy webhook_enc từ Supabase
@@ -149,7 +185,7 @@ module.exports = async (req, res) => {
       body: rawBody,
     });
 
-    const text = await discordResp.text(); // nếu ?wait=true thì đây là JSON string
+    const text = await discordResp.text();
 
     res
       .status(discordResp.status)
