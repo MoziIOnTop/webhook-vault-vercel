@@ -180,11 +180,15 @@ module.exports = async (req, res) => {
       body: rawBody,
     });
 
-    const text = await discordResp.text();
+   const text = await discordResp.text();
+const ct = discordResp.headers.get("content-type") || "";
 
-    res
-      .status(discordResp.status)
-      .json({ status: discordResp.status, response: text });
+if (ct.includes("application/json")) {
+  res.setHeader("Content-Type", "application/json");
+}
+
+res.status(discordResp.status).send(text);
+
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Internal error" });
